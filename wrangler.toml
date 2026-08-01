@@ -6,7 +6,7 @@ compatibility_flags = ["nodejs_compat"]
 # KV 命名空间绑定
 [[kv_namespaces]]
 binding = "USAGE_ALERT_STATE"
-id = "你的 KV 命名空间 ID"
+id = "request_monitor"
 
 # Cron 定时触发器（每 30 分钟）
 [triggers]

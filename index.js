@@ -246,6 +246,10 @@ async function getUsageData(env) {
   const result = await resp.json();
   const data = result?.data?.viewer?.accounts?.[0]?.workersInvocationsAdaptive || [];
 
+// 在 const result = await resp.json(); 之后添加
+console.log('🔍 GraphQL 响应:', JSON.stringify(result, null, 2));
+console.log('📊 data路径:', result?.data?.viewer?.accounts?.[0]?.workersInvocationsAdaptive);
+  
   const totalRequests = data.reduce((acc, item) => acc + (item.sum?.requests || 0), 0);
   const totalCpuMs = data.reduce((acc, item) => acc + (item.sum?.cpuMs || 0), 0);
 

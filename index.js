@@ -17,40 +17,42 @@ import { WorkerMailer } from '@workermailer/smtp';
 // SMTP_FROM_NAME     : 发件人名称（可选）
 // SMTP_FROM_EMAIL    : 发件人邮箱
 // ---- 监控配置 ----
-// CF_API_TOKEN       : Cloudflare API Token（需 Analytics:Read）
-// CF_ACCOUNT_ID      : Cloudflare 账户 ID
+// CF_API_TOKEN 或 API_TOKEN : Cloudflare API Token（需 Analytics:Read）
+// CF_ACCOUNT_ID 或 ACCOUNT_ID : Cloudflare 账户 ID
 // WORKER_NAME        : 要监控的 Worker 名称（留空则监控全部）
 // THRESHOLD_REQUESTS : 请求数阈值
 // ALERT_EMAIL        : 告警邮件接收地址（必填）
 // ============================================================
 
 export default {
-  // ---------- Cron 定时触发（每 30 分钟） ----------
   async scheduled(event, env, ctx) {
     await checkUsageAndAlert(env);
   },
 
-  // ---------- HTTP 请求 ----------
   async fetch(request, env) {
     const url = new URL(request.url);
     const method = request.method;
 
-    // 根路径 -> 前端仪表盘
     if (url.pathname === '/' && method === 'GET') {
       return new Response(getDashboardHTML(), {
         headers: { 'Content-Type': 'text/html' },
       });
     }
 
-    // API: 获取用量数据
     if (url.pathname === '/api/usage' && method === 'GET') {
-      const data = await getUsageData(env);
-      return new Response(JSON.stringify(data), {
-        headers: { 'Content-Type': 'application/json' },
-      });
+      try {
+        const data = await getUsageData(env);
+        return new Response(JSON.stringify(data), {
+          headers: { 'Content-Type': 'application/json' },
+        });
+      } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+          status: 500,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
     }
 
-    // API: 手动触发检测
     if (url.pathname === '/api/check' && method === 'POST') {
       await checkUsageAndAlert(env);
       return new Response('检测已触发', { status: 200 });
@@ -141,7 +143,6 @@ async function checkUsageAndAlert(env) {
     }
   }
 
-  // KV 去重
   const kv = env.USAGE_ALERT_STATE;
   let lastLevel = 0;
   if (kv) {
@@ -155,7 +156,6 @@ async function checkUsageAndAlert(env) {
     const matched = levels.find(lv => lv.level === currentLevel);
     const label = matched ? matched.label : `${currentLevel}%`;
 
-    // 构建告警邮件内容
     const workerDisplay = env.WORKER_NAME?.trim() || '全部 Worker（账户总计）';
     const subject = `⚠️ Worker 用量已达 ${label} - ${new Date().toLocaleDateString()}`;
     const html = `
@@ -185,7 +185,6 @@ async function checkUsageAndAlert(env) {
     }
   }
 
-  // 缓存用量数据（可选）
   if (kv) {
     await kv.put('last_usage', JSON.stringify(usage), { expirationTtl: 3600 });
   }
@@ -194,64 +193,62 @@ async function checkUsageAndAlert(env) {
 }
 
 // ============================================================
-// 获取用量数据（GraphQL）
+// 获取用量数据（使用你已验证过的查询方式）
 // ============================================================
 async function getUsageData(env) {
-  const accountId = env.CF_ACCOUNT_ID;
+  const accountId = env.CF_ACCOUNT_ID || env.ACCOUNT_ID;
   const workerName = env.WORKER_NAME?.trim() || '';
+  const token = env.CF_API_TOKEN || env.API_TOKEN;
 
-  const now = new Date();
-  const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
-  const startISO = startOfMonth.toISOString();
-  const endISO = now.toISOString();
-
-  let filterStr = `datetime_gt: "${startISO}", datetime_lt: "${endISO}"`;
-  if (workerName !== '') {
-    filterStr += `, scriptName: "${workerName}"`;
+  if (!accountId || !token) {
+    throw new Error('缺少 ACCOUNT_ID 或 API_TOKEN');
   }
 
-  const query = `
-    query {
-      viewer {
-        accounts(filter: { accountTag: "${accountId}" }) {
-          workersInvocationsAdaptive(
-            filter: { ${filterStr} }
-            limit: 10000
-          ) {
-            sum {
-              requests
-              cpuMs
-            }
-            dimensions {
-              datetimeHour
+  const now = new Date();
+  const todayStart = new Date(now);
+  todayStart.setUTCHours(0, 0, 0, 0);
+  const datetimeStart = todayStart.toISOString();
+  const datetimeEnd = now.toISOString();
+
+  const query = {
+    query: `
+      query {
+        viewer {
+          accounts(filter: {accountTag: "${accountId}"}) {
+            workersInvocationsAdaptive(
+              filter: {
+                datetime_gt: "${datetimeStart}",
+                datetime_leq: "${datetimeEnd}"
+                ${workerName ? `, scriptName: "${workerName}"` : ''}
+              }
+              limit: 1
+            ) {
+              sum { requests cpuMs }
+              dimensions {
+                datetimeHour
+              }
             }
           }
         }
       }
-    }
-  `;
+    `
+  };
 
-  const response = await fetch('https://api.cloudflare.com/client/v4/graphql', {
+  const resp = await fetch('https://api.cloudflare.com/client/v4/graphql', {
     method: 'POST',
     headers: {
-      'Authorization': `Bearer ${env.CF_API_TOKEN}`,
+      'Authorization': `Bearer ${token}`,
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({ query }),
+    body: JSON.stringify(query),
   });
 
-  const result = await response.json();
+  const result = await resp.json();
   const data = result?.data?.viewer?.accounts?.[0]?.workersInvocationsAdaptive || [];
 
-  const total = data.reduce(
-    (acc, item) => ({
-      requests: acc.requests + (item.sum?.requests || 0),
-      cpuMs: acc.cpuMs + (item.sum?.cpuMs || 0),
-    }),
-    { requests: 0, cpuMs: 0 }
-  );
+  const totalRequests = data.reduce((acc, item) => acc + (item.sum?.requests || 0), 0);
+  const totalCpuMs = data.reduce((acc, item) => acc + (item.sum?.cpuMs || 0), 0);
 
-  // 按天聚合（最近7天）
   const dailyMap = {};
   data.forEach(item => {
     const date = item.dimensions?.datetimeHour?.split('T')[0];
@@ -270,15 +267,15 @@ async function getUsageData(env) {
   }));
 
   return {
-    requests: total.requests,
-    cpuMs: total.cpuMs,
+    requests: totalRequests,
+    cpuMs: totalCpuMs,
     daily,
     monitorTarget: workerName || '全部 Worker',
   };
 }
 
 // ============================================================
-// 前端仪表盘 HTML（同前，无修改）
+// 前端仪表盘 HTML（同前）
 // ============================================================
 function getDashboardHTML() {
   return `
@@ -343,11 +340,15 @@ function getDashboardHTML() {
 
 <script>
   let chart = null;
-  const THRESHOLD = 100000; // 应与环境变量一致
+  const THRESHOLD = 100000;
 
   async function loadData() {
     try {
       const res = await fetch('/api/usage');
+      if (!res.ok) {
+        const err = await res.json();
+        throw new Error(err.error || '请求失败');
+      }
       const data = await res.json();
 
       document.getElementById('requests').textContent = data.requests.toLocaleString();
@@ -429,6 +430,7 @@ function getDashboardHTML() {
       }
     } catch (e) {
       console.error('加载失败:', e);
+      document.getElementById('requests').textContent = '❌ 加载失败';
     }
   }
 

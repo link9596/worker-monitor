@@ -1,16 +1,27 @@
 // ============================================================
-// 用量监控 Worker - 支持单 Worker/全账户监控 + 分级告警 + 前端仪表盘
+// 合并 Worker：用量监控 + 内部邮件告警
 // ============================================================
+
+import { WorkerMailer } from '@workermailer/smtp';
 
 // ============================================================
 // 环境变量说明
 // ============================================================
-// CF_API_TOKEN      : Cloudflare API Token（需 Analytics:Read 权限）
-// CF_ACCOUNT_ID     : Cloudflare 账户 ID
-// WORKER_NAME       : 要监控的 Worker 名称。若留空，则监控整个账户所有 Worker 的总用量
-// THRESHOLD_REQUESTS: 请求数阈值（如 100000，表示 10 万次）
-// ALERT_EMAIL       : 告警邮件接收地址
-// MAIL_WORKER_URL   : 已有邮件发送 Worker 的 URL
+// ---- SMTP 配置（仅用于内部告警） ----
+// SMTP_HOST          : SMTP 服务器地址
+// SMTP_PORT          : 端口
+// SMTP_SECURE        : 是否 SSL（true/false）
+// SMTP_USER          : 登录用户名
+// SMTP_PASS          : 密码/授权码（加密）
+// SMTP_AUTH_TYPE     : 认证方式（login/plain，默认 login）
+// SMTP_FROM_NAME     : 发件人名称（可选）
+// SMTP_FROM_EMAIL    : 发件人邮箱
+// ---- 监控配置 ----
+// CF_API_TOKEN       : Cloudflare API Token（需 Analytics:Read）
+// CF_ACCOUNT_ID      : Cloudflare 账户 ID
+// WORKER_NAME        : 要监控的 Worker 名称（留空则监控全部）
+// THRESHOLD_REQUESTS : 请求数阈值
+// ALERT_EMAIL        : 告警邮件接收地址（必填）
 // ============================================================
 
 export default {
@@ -22,24 +33,25 @@ export default {
   // ---------- HTTP 请求 ----------
   async fetch(request, env) {
     const url = new URL(request.url);
+    const method = request.method;
 
-    // 根路径 -> 前端仪表盘 HTML
-    if (url.pathname === '/' && request.method === 'GET') {
+    // 根路径 -> 前端仪表盘
+    if (url.pathname === '/' && method === 'GET') {
       return new Response(getDashboardHTML(), {
         headers: { 'Content-Type': 'text/html' },
       });
     }
 
-    // API: 获取当前用量数据（供前端图表使用）
-    if (url.pathname === '/api/usage' && request.method === 'GET') {
+    // API: 获取用量数据
+    if (url.pathname === '/api/usage' && method === 'GET') {
       const data = await getUsageData(env);
       return new Response(JSON.stringify(data), {
         headers: { 'Content-Type': 'application/json' },
       });
     }
 
-    // API: 手动触发一次检测
-    if (url.pathname === '/api/check' && request.method === 'POST') {
+    // API: 手动触发检测
+    if (url.pathname === '/api/check' && method === 'POST') {
       await checkUsageAndAlert(env);
       return new Response('检测已触发', { status: 200 });
     }
@@ -49,7 +61,62 @@ export default {
 };
 
 // ============================================================
-// 核心检测函数（含分级告警 + KV 去重）
+// 内部邮件发送函数（仅用于告警）
+// ============================================================
+async function sendEmail(to, subject, html, text, env) {
+  try {
+    const {
+      SMTP_HOST,
+      SMTP_PORT,
+      SMTP_SECURE,
+      SMTP_USER,
+      SMTP_PASS,
+      SMTP_AUTH_TYPE,
+      SMTP_FROM_NAME,
+      SMTP_FROM_EMAIL,
+    } = env;
+
+    if (!SMTP_HOST || !SMTP_PORT || !SMTP_USER || !SMTP_PASS || !SMTP_FROM_EMAIL) {
+      throw new Error('SMTP 配置不完整');
+    }
+    if (!to) {
+      throw new Error('收件人地址不能为空');
+    }
+
+    const mailer = await WorkerMailer.connect({
+      host: SMTP_HOST,
+      port: parseInt(SMTP_PORT, 10),
+      secure: SMTP_SECURE === 'true',
+      credentials: {
+        username: SMTP_USER,
+        password: SMTP_PASS,
+      },
+      authType: SMTP_AUTH_TYPE || 'login',
+    });
+
+    await mailer.send({
+      from: {
+        name: SMTP_FROM_NAME || SMTP_FROM_EMAIL,
+        email: SMTP_FROM_EMAIL,
+      },
+      to: {
+        name: '告警接收人',
+        email: to,
+      },
+      subject: subject || 'Worker 用量告警',
+      text: text || '',
+      html: html || '',
+    });
+
+    await mailer.close();
+    console.log('告警邮件发送成功');
+  } catch (error) {
+    console.error('告警邮件发送失败:', error);
+  }
+}
+
+// ============================================================
+// 监控核心函数（分级告警 + KV 去重）
 // ============================================================
 async function checkUsageAndAlert(env) {
   const usage = await getUsageData(env);
@@ -58,7 +125,6 @@ async function checkUsageAndAlert(env) {
   const threshold = parseInt(env.THRESHOLD_REQUESTS) || 100000;
   const percent = (requests / threshold) * 100;
 
-  // 定义告警级别
   const levels = [
     { level: 80, label: '80%' },
     { level: 90, label: '90%' },
@@ -66,7 +132,6 @@ async function checkUsageAndAlert(env) {
     { level: 100, label: '100%' },
   ];
 
-  // 计算当前所处的最高告警级别
   let currentLevel = 0;
   for (const lv of levels) {
     if (percent >= lv.level) {
@@ -76,7 +141,7 @@ async function checkUsageAndAlert(env) {
     }
   }
 
-  // 从 KV 读取上次告警级别
+  // KV 去重
   const kv = env.USAGE_ALERT_STATE;
   let lastLevel = 0;
   if (kv) {
@@ -86,25 +151,41 @@ async function checkUsageAndAlert(env) {
     }
   }
 
-  // 如果当前级别 > 上次级别，则发送告警并更新 KV
   if (currentLevel > lastLevel) {
     const matched = levels.find(lv => lv.level === currentLevel);
     const label = matched ? matched.label : `${currentLevel}%`;
 
-    await sendAlertEmail(env, {
-      requests,
-      percent,
-      threshold,
-      level: currentLevel,
-      label,
-    });
+    // 构建告警邮件内容
+    const workerDisplay = env.WORKER_NAME?.trim() || '全部 Worker（账户总计）';
+    const subject = `⚠️ Worker 用量已达 ${label} - ${new Date().toLocaleDateString()}`;
+    const html = `
+      <h2>⚠️ Worker 用量告警</h2>
+      <p><strong>监控范围:</strong> ${workerDisplay}</p>
+      <p><strong>检测时间:</strong> ${new Date().toLocaleString()}</p>
+      <hr>
+      <h3>📊 当前用量</h3>
+      <ul>
+        <li>请求数: <b>${requests.toLocaleString()}</b> (阈值: ${threshold.toLocaleString()})</li>
+        <li>使用率: <b>${percent.toFixed(1)}%</b></li>
+        <li>达到级别: <b style="color:red;">${label}</b></li>
+      </ul>
+      <p style="color: #666; font-size: 12px;">此邮件由监控系统自动发送</p>
+    `;
+    const text = `Worker 用量告警\n\n监控范围: ${workerDisplay}\n请求数: ${requests}/${threshold} (${percent.toFixed(1)}%)\n级别: ${label}`;
+
+    const alertEmail = env.ALERT_EMAIL;
+    if (alertEmail) {
+      await sendEmail(alertEmail, subject, html, text, env);
+    } else {
+      console.error('未设置 ALERT_EMAIL，无法发送告警');
+    }
 
     if (kv) {
       await kv.put('alert_level', JSON.stringify(currentLevel));
     }
   }
 
-  // 将用量数据存入 KV（供参考，可选）
+  // 缓存用量数据（可选）
   if (kv) {
     await kv.put('last_usage', JSON.stringify(usage), { expirationTtl: 3600 });
   }
@@ -113,19 +194,17 @@ async function checkUsageAndAlert(env) {
 }
 
 // ============================================================
-// 获取用量数据（GraphQL API）
-// - 若 WORKER_NAME 为空，则监控整个账户所有 Worker 的总用量
+// 获取用量数据（GraphQL）
 // ============================================================
 async function getUsageData(env) {
   const accountId = env.CF_ACCOUNT_ID;
-  const workerName = env.WORKER_NAME?.trim() || ''; // 若为空则监控全部
+  const workerName = env.WORKER_NAME?.trim() || '';
 
   const now = new Date();
   const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
   const startISO = startOfMonth.toISOString();
   const endISO = now.toISOString();
 
-  // 构建过滤条件
   let filterStr = `datetime_gt: "${startISO}", datetime_lt: "${endISO}"`;
   if (workerName !== '') {
     filterStr += `, scriptName: "${workerName}"`;
@@ -162,9 +241,8 @@ async function getUsageData(env) {
   });
 
   const result = await response.json();
-
-  // 解析数据
   const data = result?.data?.viewer?.accounts?.[0]?.workersInvocationsAdaptive || [];
+
   const total = data.reduce(
     (acc, item) => ({
       requests: acc.requests + (item.sum?.requests || 0),
@@ -173,7 +251,7 @@ async function getUsageData(env) {
     { requests: 0, cpuMs: 0 }
   );
 
-  // 按天聚合（用于图表，保留最近 7 天）
+  // 按天聚合（最近7天）
   const dailyMap = {};
   data.forEach(item => {
     const date = item.dimensions?.datetimeHour?.split('T')[0];
@@ -195,51 +273,12 @@ async function getUsageData(env) {
     requests: total.requests,
     cpuMs: total.cpuMs,
     daily,
+    monitorTarget: workerName || '全部 Worker',
   };
 }
 
 // ============================================================
-// 发送告警邮件（调用已有的邮件 Worker）
-// ============================================================
-async function sendAlertEmail(env, alertInfo) {
-  const { requests, percent, threshold, label } = alertInfo;
-  const mailWorkerUrl = env.MAIL_WORKER_URL;
-  if (!mailWorkerUrl) {
-    console.error('未配置 MAIL_WORKER_URL');
-    return;
-  }
-
-  const workerDisplay = env.WORKER_NAME?.trim() || '全部 Worker（账户总计）';
-
-  const subject = `⚠️ Worker 用量已达 ${label} - ${new Date().toLocaleDateString()}`;
-  const html = `
-    <h2>⚠️ Worker 用量告警</h2>
-    <p><strong>监控范围:</strong> ${workerDisplay}</p>
-    <p><strong>检测时间:</strong> ${new Date().toLocaleString()}</p>
-    <hr>
-    <h3>📊 当前用量</h3>
-    <ul>
-      <li>请求数: <b>${requests.toLocaleString()}</b> (阈值: ${threshold.toLocaleString()})</li>
-      <li>使用率: <b>${percent.toFixed(1)}%</b></li>
-      <li>达到级别: <b style="color:red;">${label}</b></li>
-    </ul>
-    <p style="color: #666; font-size: 12px;">此邮件由监控系统自动发送，如需调整阈值请修改环境变量 THRESHOLD_REQUESTS。</p>
-  `;
-
-  await fetch(mailWorkerUrl, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      to: env.ALERT_EMAIL,
-      subject: subject,
-      html: html,
-      text: `Worker 用量告警\n\n监控范围: ${workerDisplay}\n请求数: ${requests}/${threshold} (${percent.toFixed(1)}%)\n级别: ${label}`,
-    }),
-  });
-}
-
-// ============================================================
-// 前端仪表盘 HTML（含 Chart.js）
+// 前端仪表盘 HTML（同前，无修改）
 // ============================================================
 function getDashboardHTML() {
   return `
@@ -254,7 +293,7 @@ function getDashboardHTML() {
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0a0a0f; color: #e0e0e0; padding: 20px; }
     .container { max-width: 1000px; margin: 0 auto; }
-    h1 { font-size: 24px; margin-bottom: 20px; color: #f0f0f0; }
+    h1 { font-size: 24px; margin-bottom: 10px; color: #f0f0f0; }
     .subtitle { font-size: 14px; color: #888; margin-bottom: 20px; }
     .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 16px; margin-bottom: 24px; }
     .card { background: #1a1a2e; padding: 18px; border-radius: 12px; border: 1px solid #2a2a4a; }
@@ -304,9 +343,7 @@ function getDashboardHTML() {
 
 <script>
   let chart = null;
-
-  // 阈值（应与环境变量 THRESHOLD_REQUESTS 一致）
-  const THRESHOLD = 100000;
+  const THRESHOLD = 100000; // 应与环境变量一致
 
   async function loadData() {
     try {
@@ -319,7 +356,6 @@ function getDashboardHTML() {
       const pct = Math.min((data.requests / THRESHOLD) * 100, 100);
       document.getElementById('percent').textContent = pct.toFixed(1) + '%';
 
-      // 状态判断
       const statusEl = document.getElementById('status');
       const dotEl = document.getElementById('statusDot');
       const textEl = document.getElementById('statusText');
@@ -349,7 +385,6 @@ function getDashboardHTML() {
       document.getElementById('lastUpdate').textContent = '更新时间: ' + new Date().toLocaleString();
       document.getElementById('monitorTarget').textContent = '监控范围: ' + (data.monitorTarget || '全部 Worker');
 
-      // 更新图表（最近7天）
       if (data.daily && data.daily.length > 0) {
         const dates = data.daily.map(d => d.date);
         const reqData = data.daily.map(d => d.requests);
